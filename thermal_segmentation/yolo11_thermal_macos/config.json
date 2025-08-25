@@ -1,0 +1,12 @@
+{
+  "model_name": "yolo11n-seg.pt",
+  "dataset_yaml": "./dataset/datasets/thermal_24h_yolo/dataset.yaml",
+  "project_name": "thermal_segmentation",
+  "experiment_name": "yolo11_thermal_macos",
+  "epochs": 50,
+  "imgsz": 640,
+  "batch_size": 8,
+  "lr0": 0.01,
+  "patience": 30,
+  "workers": 4
+}

@@ -1,0 +1,35 @@
+{
+  "name": "ir-image-backend",
+  "version": "1.0.0",
+  "description": "Backend API for IR Image Patient Care System",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "init-db": "node scripts/init-db.js",
+    "import-data": "node scripts/import-markdown-data.js",
+    "db-manager": "node scripts/db-manager.js"
+  },
+  "dependencies": {
+    "axios": "^1.11.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "fs-extra": "^11.1.1",
+    "joi": "^17.11.0",
+    "multer": "^1.4.5-lts.1",
+    "path": "^0.12.7",
+    "sqlite3": "^5.1.6",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "medical",
+    "prediction",
+    "sqlite",
+    "api"
+  ],
+  "author": "IR Image Team",
+  "license": "MIT"
+}
