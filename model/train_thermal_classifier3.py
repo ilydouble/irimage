@@ -580,7 +580,7 @@ class ContrastiveThermalClassifier:
         print("=== 第二阶段：微调分类器 ===")
         
         # 准备分类数据集
-        full_dataset = ContrastiveThermalDataset(self.data_dir, self.transform, mode='classification' )
+        full_dataset = ContrastiveThermalDataset(self.data_dir, self.transform, mode='classification', use_asymmetry_analysis=self.use_asymmetry_analysis)
         
         # 检查数据分布
         all_labels = [full_dataset[i][1] for i in range(len(full_dataset))]
@@ -1068,13 +1068,13 @@ def main():
     output_dir = "./model/contrastive_thermal_classifier_results"
     
     # 选项1: 完整训练（对比学习 + 分类）
-    # classifier = ContrastiveThermalClassifier(data_dir, output_dir, use_asymmetry_analysis=True)
-    # model, results = classifier.run_full_training(skip_contrastive=False)
+    classifier = ContrastiveThermalClassifier(data_dir, output_dir, use_asymmetry_analysis=True)
+    model, results = classifier.run_full_training(skip_contrastive=False)
     
     # 选项2: 只进行分类微调（需要指定预训练编码器路径）
-    pretrained_path = "./model/contrastive_thermal_classifier_results/run_20250826_234950__/best_contrastive_encoder.pth"
-    classifier = ContrastiveThermalClassifier(data_dir, output_dir, pretrained_encoder_path=pretrained_path, use_asymmetry_analysis=True)
-    model, results = classifier.run_full_training(skip_contrastive=True)
+    # pretrained_path = "./model/contrastive_thermal_classifier_results/run_20250826_234950__/best_contrastive_encoder.pth"
+    # classifier = ContrastiveThermalClassifier(data_dir, output_dir, pretrained_encoder_path=pretrained_path, use_asymmetry_analysis=True)
+    # model, results = classifier.run_full_training(skip_contrastive=True)
     
     print(f"\n=== 最终结果 ===")
     print(f"测试准确率: {results['accuracy']:.4f}")
