@@ -124,44 +124,42 @@ class ContrastiveThermalDataset(Dataset):
         return torch.zeros(3, 224, 112), torch.zeros(3, 224, 112), torch.tensor(0.0)
     
     def _get_classification_sample(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """获取分类任务的样本"""
+        """获取分类任务的样本 - 修复版本"""
         img_path = self.image_paths[index]
         label = self.labels[index]
-        
+    
         img = self._process_image(img_path)
         if img is None:
             # 返回零张量作为fallback
-            img = torch.zeros(3, 224, 112)
-        
-        return img, torch.tensor(label, dtype=torch.long)
+            if self.use_asymmetry_analysis:
+                img = torch.zeros(6, 224, 112)  # 6通道
+            else:
+                img = torch.zeros(3, 224, 224)  # 3通道
     
+        return img, torch.tensor(label, dtype=torch.long)
+
     def _process_image(self, img_path: str) -> Optional[torch.Tensor]:
         """处理单张图像 - 改进版本"""
         try:
             face_img = Image.open(img_path).convert("RGB")
-            
+        
             if self.use_asymmetry_analysis:
                 # 如果需要分析不对称性
                 halves = preprocess_and_split_face(face_img)
                 if halves is None:
                     return None
                 left_half, right_half = halves
-                
+            
                 # 方案1: 拼接左右脸
                 left_tensor = self.transform(left_half)
                 right_tensor = self.transform(right_half)
                 # 在通道维度拼接 (3+3=6通道)
                 return torch.cat([left_tensor, right_tensor], dim=0)
-                
-                # 方案2: 只用左脸 (当前的做法)
-                # return self.transform(left_half)
-                
-                # 方案3: 计算差异特征 (需要修改网络结构)
-                # return self.compute_asymmetry_features(left_half, right_half)
             else:
                 # 直接使用完整人脸进行分类
                 return self.transform(face_img)
-        except:
+        except Exception as e:
+            print(f"图像处理错误 {img_path}: {e}")
             return None
 
 # ======================================================================================
@@ -631,9 +629,34 @@ class ContrastiveThermalClassifier:
             model = pretrained_encoder
         else:
             model = ThermalEncoder(backbone='resnet18').to(self.device)
+            
+            # 如果使用不对称分析，需要调整模型结构
+            if self.use_asymmetry_analysis:
+                # 调整第一层卷积为6通道输入
+                original_conv1 = model.backbone.conv1
+                model.backbone.conv1 = nn.Conv2d(
+                    6, original_conv1.out_channels, 
+                    kernel_size=original_conv1.kernel_size,
+                    stride=original_conv1.stride,
+                    padding=original_conv1.padding,
+                    bias=original_conv1.bias is not None
+                ).to(self.device)
+                
+                # 初始化新的卷积层权重
+                with torch.no_grad():
+                    new_weight = torch.zeros(original_conv1.out_channels, 6, 
+                                        original_conv1.kernel_size[0], 
+                                        original_conv1.kernel_size[1])
+                    new_weight[:, :3, :, :] = original_conv1.weight.data
+                    new_weight[:, 3:, :, :] = original_conv1.weight.data
+                    model.backbone.conv1.weight.data = new_weight
+                
+                print("分类模型已调整为6通道输入（不对称分析模式）")
+            
+            # 加载预训练编码器权重
             encoder_path = self.run_dir / "contrastive_encoder.pth"
             if encoder_path.exists():
-                model.load_state_dict(torch.load(encoder_path))
+                model.load_state_dict(torch.load(encoder_path, map_location=self.device))
                 print("已加载预训练编码器")
         
         # 冻结编码器
@@ -927,7 +950,7 @@ class ContrastiveThermalClassifier:
         
         # 第二阶段：分类微调（使用训练+验证集训练，测试集评估）
         print("=== 第二阶段：分类微调 ===")
-        model, test_results = self.train_classifier(encoder, epochs=30, batch_size=32, lr=0.00005)
+        model, test_results = self.train_classifier(encoder, epochs=30, batch_size=32, lr=0.00001)
         
         
         return model, test_results
@@ -1049,8 +1072,8 @@ def main():
     # model, results = classifier.run_full_training(skip_contrastive=False)
     
     # 选项2: 只进行分类微调（需要指定预训练编码器路径）
-    pretrained_path = "./model/contrastive_thermal_classifier_results/run_20250826_183759__/best_contrastive_encoder.pth"
-    classifier = ContrastiveThermalClassifier(data_dir, output_dir, pretrained_encoder_path=pretrained_path, use_asymmetry_analysis=False)
+    pretrained_path = "./model/contrastive_thermal_classifier_results/run_20250826_234950__/best_contrastive_encoder.pth"
+    classifier = ContrastiveThermalClassifier(data_dir, output_dir, pretrained_encoder_path=pretrained_path, use_asymmetry_analysis=True)
     model, results = classifier.run_full_training(skip_contrastive=True)
     
     print(f"\n=== 最终结果 ===")

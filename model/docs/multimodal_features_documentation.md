@@ -5,8 +5,8 @@
 ## 概述
 
 多模态特征文件包含了从热力图图像和临床数据中提取的特征，用于ICAS（颅内动脉粥样硬化性狭窄）分类任务。特征分为三大类：
-- **图像特征**：从热力图中提取的温度、纹理和形状特征
-- **临床特征**：从数据库中获取的患者生理指标
+- **图像特征**：从热力图中提取的温度、纹理和形状特征（324维）
+- **临床特征**：从数据库中获取的患者生理指标（13维）
 - **标识字段**：患者ID和分类标签
 
 ## 1. 标识字段
@@ -17,7 +17,7 @@
 | `label` | int | 分类标签 (0: non_icas, 1: icas) |
 | `has_icas` | int | 数据库中的ICAS诊断结果 (0/1) |
 
-## 2. 图像特征
+## 2. 图像特征（324维）
 
 ### 2.1 温度特征 (Temperature Features)
 
@@ -69,34 +69,76 @@ red_blue_ratio = red_channel / (blue_channel + 1e-8)
 
 ### 2.2 纹理特征 (Texture Features)
 
-基于灰度共生矩阵(GLCM)提取纹理特征，使用多个距离和角度组合。
+基于局部二值模式(LBP)提取纹理特征，包括分块LBP直方图和全局LBP统计特征。
 
+#### 2.2.1 分块LBP直方图特征（288维）
 ```python
-# GLCM参数设置
-distances = [1, 2, 3]  # 像素距离
-angles = [0, 45, 90, 135]  # 角度(度)
+# 将图像分成4×4网格，每个块计算LBP直方图
+grid_size = 4
+block_height = gray.shape[0] // grid_size
+block_width = gray.shape[1] // grid_size
 
-# 对每个距离-角度组合计算GLCM特征
-glcm = graycomatrix(gray_reduced, distances=[dist], angles=[angle_rad], 
-                   levels=64, symmetric=True, normed=True)
+for i in range(grid_size):
+    for j in range(grid_size):
+        # 提取每个块
+        block = gray[i*block_height:(i+1)*block_height, 
+                    j*block_width:(j+1)*block_width]
+        
+        # 计算LBP
+        lbp = local_binary_pattern(block, P=8, R=1, method='uniform')
+        
+        # 计算直方图（18个bin）
+        hist, _ = np.histogram(lbp.ravel(), bins=18, range=(0, 18))
+        hist = hist.astype(float)
+        hist /= (hist.sum() + 1e-8)  # 归一化
 ```
 
-#### 2.2.1 GLCM特征命名规则
-格式：`glcm_d{距离}_a{角度}_{特征名}`
+**特征命名规则：** `lbp_block_{行}_{列}_bin_{bin索引}`
 
 **示例字段：**
-- `glcm_d1_a0_contrast`: 距离1，角度0°的对比度
-- `glcm_d2_a45_homogeneity`: 距离2，角度45°的同质性
-- `glcm_d3_a90_energy`: 距离3，角度90°的能量
+- `lbp_block_0_0_bin_0` 到 `lbp_block_0_0_bin_17`: 第(0,0)块的18个LBP直方图bin
+- `lbp_block_0_1_bin_0` 到 `lbp_block_0_1_bin_17`: 第(0,1)块的18个LBP直方图bin
+- ...
+- `lbp_block_3_3_bin_0` 到 `lbp_block_3_3_bin_17`: 第(3,3)块的18个LBP直方图bin
 
-#### 2.2.2 GLCM特征类型
-| 特征名 | 计算方法 | 含义 |
+**总计：** 4×4×18 = 288个分块LBP直方图特征
+
+#### 2.2.2 全局LBP统计特征（12维）
+```python
+# 计算整个图像的LBP
+lbp_global = local_binary_pattern(gray, P=8, R=1, method='uniform')
+
+# 提取统计特征
+lbp_features = {
+    'lbp_mean': np.mean(lbp_global),
+    'lbp_std': np.std(lbp_global),
+    'lbp_max': np.max(lbp_global),
+    'lbp_min': np.min(lbp_global),
+    'lbp_median': np.median(lbp_global),
+    'lbp_range': np.max(lbp_global) - np.min(lbp_global),
+    'lbp_p25': np.percentile(lbp_global, 25),
+    'lbp_p75': np.percentile(lbp_global, 75),
+    'lbp_iqr': np.percentile(lbp_global, 75) - np.percentile(lbp_global, 25),
+    'lbp_skewness': scipy.stats.skew(lbp_global.ravel()),
+    'lbp_kurtosis': scipy.stats.kurtosis(lbp_global.ravel()),
+    'lbp_entropy': shannon_entropy(lbp_global)
+}
+```
+
+| 字段名 | 计算方法 | 含义 |
 |--------|----------|------|
-| `contrast` | `graycoprops(glcm, 'contrast')` | 对比度，衡量局部变化 |
-| `dissimilarity` | `graycoprops(glcm, 'dissimilarity')` | 相异性 |
-| `homogeneity` | `graycoprops(glcm, 'homogeneity')` | 同质性，衡量纹理均匀性 |
-| `energy` | `graycoprops(glcm, 'energy')` | 能量，衡量纹理规律性 |
-| `correlation` | `graycoprops(glcm, 'correlation')` | 相关性 |
+| `lbp_mean` | `np.mean(lbp_global)` | LBP均值 |
+| `lbp_std` | `np.std(lbp_global)` | LBP标准差 |
+| `lbp_max` | `np.max(lbp_global)` | LBP最大值 |
+| `lbp_min` | `np.min(lbp_global)` | LBP最小值 |
+| `lbp_median` | `np.median(lbp_global)` | LBP中位数 |
+| `lbp_range` | `max - min` | LBP范围 |
+| `lbp_p25` | `np.percentile(lbp_global, 25)` | 25%分位数 |
+| `lbp_p75` | `np.percentile(lbp_global, 75)` | 75%分位数 |
+| `lbp_iqr` | `p75 - p25` | 四分位距 |
+| `lbp_skewness` | `scipy.stats.skew(lbp_global)` | 偏度 |
+| `lbp_kurtosis` | `scipy.stats.kurtosis(lbp_global)` | 峰度 |
+| `lbp_entropy` | `shannon_entropy(lbp_global)` | 香农熵 |
 
 ### 2.3 形状特征 (Shape Features)
 
@@ -128,7 +170,7 @@ contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPL
 | `bbox_aspect_ratio_{i}` | `width / height` | 边界框宽高比 |
 | `bbox_extent_{i}` | `area / (width × height)` | 边界框填充率 |
 
-## 3. 临床特征
+## 3. 临床特征（13维）
 
 从数据库 `patients` 表中提取的患者生理指标。
 
@@ -180,22 +222,66 @@ def age_group(age):
 | `bmi_category` | 0-3 | BMI分类 (0:偏瘦, 1:正常, 2:超重, 3:肥胖) |
 | `age_group` | 0-3 | 年龄分组 (0:<30, 1:30-45, 2:45-60, 3:≥60) |
 
-## 4. 数据预处理
+## 4. 特征维度总结
 
-### 4.1 缺失值处理
+| 特征类型 | 子类型 | 维度 | 说明 |
+|----------|--------|------|------|
+| **图像特征** | 温度特征 | ~18维 | HSV色调统计 + 红蓝比值 + 区域特征 |
+| | 分块LBP直方图 | 288维 | 4×4网格，每块18个bin |
+| | 全局LBP统计 | 12维 | 整体LBP的统计量 |
+| | 形状特征 | ~6维 | 2种阈值方法的轮廓特征 |
+| | **图像特征小计** | **324维** | |
+| **临床特征** | 基础指标 | 8维 | 年龄、性别、身高等 |
+| | 衍生特征 | 3维 | 腰臀比等比值特征 |
+| | 分类特征 | 2维 | BMI分类、年龄分组 |
+| | **临床特征小计** | **13维** | |
+| **标识字段** | | 3维 | patient_id, label, has_icas |
+| **总计** | | **340维** | 324 + 13 + 3 |
+
+## 5. 数据预处理
+
+### 5.1 缺失值处理
 - **数值型特征**: 使用中位数填充
 - **分类型特征**: 使用众数填充
-- **图像特征**: 使用0填充
+- **图像特征**: 使用0填充（提取失败时）
 
-### 4.2 特征标准化
+### 5.2 特征标准化
 - **图像特征**: 使用RobustScaler (对异常值更鲁棒)
 - **临床特征**: 使用StandardScaler
 
-### 4.3 特征选择
+### 5.3 特征选择
 - **方差阈值**: 移除方差小于0.01的特征
-- **PCA降维**: 当图像特征维度>100时，降维到100维
+- **SelectKBest**: 选择最重要的特征
+- **最终维度**: 337维 → 42维（图像29维 + 临床13维）
 
-## 5. 使用示例
+## 6. LBP特征详解
+
+### 6.1 LBP算法原理
+```python
+# LBP计算示例
+def local_binary_pattern(image, P=8, R=1, method='uniform'):
+    """
+    P: 采样点数量 (8个邻域点)
+    R: 采样半径 (1像素)
+    method: 'uniform' 只考虑uniform模式
+    """
+    # 返回LBP编码图像
+```
+
+### 6.2 分块策略优势
+1. **空间信息保留**: 4×4网格保留了纹理的空间分布
+2. **局部特征捕捉**: 每个块独立计算，捕捉局部纹理变化
+3. **特征丰富性**: 288维分块特征提供丰富的纹理描述
+4. **旋转不变性**: uniform LBP具有旋转不变性
+
+### 6.3 直方图归一化
+```python
+# 每个块的LBP直方图都进行归一化
+hist = hist.astype(float)
+hist /= (hist.sum() + 1e-8)  # 避免除零错误
+```
+
+## 7. 使用示例
 
 ```python
 # 加载特征文件
@@ -209,20 +295,29 @@ print(f"ICAS分布: {features_df['label'].value_counts()}")
 
 # 分离不同类型特征
 image_features = [col for col in features_df.columns 
-                 if col.startswith(('hue_', 'rb_', 'glcm_', 'contour_', 'bbox_', 'foreground_', 'high_temp_'))]
+                 if col.startswith(('hue_', 'rb_', 'lbp_', 'contour_', 'bbox_', 'foreground_', 'high_temp_'))]
 clinical_features = ['age', 'gender_encoded', 'height', 'weight', 'bmi', 'waist', 'hip', 'neck',
                     'waist_hip_ratio', 'waist_height_ratio', 'neck_height_ratio', 'bmi_category', 'age_group']
+
+# 查看LBP特征
+lbp_block_features = [col for col in features_df.columns if col.startswith('lbp_block_')]
+lbp_global_features = [col for col in features_df.columns if col.startswith('lbp_') and not col.startswith('lbp_block_')]
+
+print(f"分块LBP特征数: {len(lbp_block_features)}")  # 应该是288
+print(f"全局LBP特征数: {len(lbp_global_features)}")  # 应该是12
 ```
 
-## 6. 注意事项
+## 8. 注意事项
 
-1. **图像质量**: 特征提取依赖于图像质量，低质量图像可能产生无效特征
+1. **图像质量**: LBP特征对图像质量敏感，低质量图像可能产生噪声特征
 2. **背景处理**: 使用饱和度和明度阈值排除背景，阈值设置为30
-3. **数据匹配**: 图像特征与临床特征通过patient_id匹配，未匹配的样本用中位数/众数填充
-4. **特征缩放**: 不同类型特征使用不同的标准化方法，使用时需注意
-5. **类别不平衡**: 数据集可能存在类别不平衡，建议使用适当的采样或加权方法
+3. **数据匹配**: 图像特征与临床特征通过patient_id匹配，匹配率达99.8%
+4. **特征缩放**: 不同类型特征使用不同的标准化方法
+5. **类别不平衡**: 数据集存在类别不平衡，使用类别权重处理
+6. **LBP参数**: P=8, R=1, method='uniform'，适合医学图像纹理分析
 
 ---
 
 *生成时间: 基于 train_thermal_classifier2.py 代码实现*
-*版本: v1.0*
+*版本: v2.0 - 增强LBP特征*
+*更新内容: 详细描述分块LBP直方图特征（288维）和全局LBP统计特征（12维）*

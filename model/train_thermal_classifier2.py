@@ -330,8 +330,8 @@ class MultiModalThermalClassifier:
         
         return features
     
-    def extract_texture_features(self, image):
-        """提取纹理特征"""
+    def extract_block_lbp_features(self, image, n_blocks=(4, 4)):
+        """提取分块LBP特征"""
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
@@ -339,52 +339,84 @@ class MultiModalThermalClassifier:
         
         features = {}
         
-        # GLCM特征
-        distances = [1, 2]
-        angles = [0, 45, 90, 135]
+        # 参数设置
+        radius = 2
+        n_points = 8 * radius
+        method = 'uniform'
         
-        for dist in distances:
-            for angle_deg in angles:
-                angle_rad = np.deg2rad(angle_deg)
-                try:
-                    gray_reduced = (gray // 4).astype(np.uint8)
-                    glcm = graycomatrix(gray_reduced, distances=[dist], angles=[angle_rad], 
-                                      levels=64, symmetric=True, normed=True)
-                    
-                    contrast = graycoprops(glcm, 'contrast')[0, 0]
-                    dissimilarity = graycoprops(glcm, 'dissimilarity')[0, 0]
-                    homogeneity = graycoprops(glcm, 'homogeneity')[0, 0]
-                    energy = graycoprops(glcm, 'energy')[0, 0]
-                    correlation = graycoprops(glcm, 'correlation')[0, 0]
-                    
-                    prefix = f'glcm_d{dist}_a{angle_deg}'
-                    features[f'{prefix}_contrast'] = contrast
-                    features[f'{prefix}_dissimilarity'] = dissimilarity
-                    features[f'{prefix}_homogeneity'] = homogeneity
-                    features[f'{prefix}_energy'] = energy
-                    features[f'{prefix}_correlation'] = correlation
-                    
-                except Exception as e:
-                    print(f"GLCM计算错误 (d={dist}, a={angle_deg}): {e}")
-        
-        # LBP特征
         try:
-            radius = 2
-            n_points = 8 * radius
-            lbp = local_binary_pattern(gray, n_points, radius, method='uniform')
+            # 计算全局LBP
+            lbp_image = local_binary_pattern(gray, n_points, radius, method)
             
-            lbp_hist, _ = np.histogram(lbp.ravel(), bins=n_points + 2, 
-                                     range=(0, n_points + 2), density=True)
+            # 获取图像尺寸
+            h, w = gray.shape
+            block_h, block_w = h // n_blocks[0], w // n_blocks[1]
             
-            for i in range(min(10, len(lbp_hist))):
-                features[f'lbp_hist_{i}'] = lbp_hist[i]
-            
-            features['lbp_mean'] = np.mean(lbp)
-            features['lbp_std'] = np.std(lbp)
-            features['lbp_entropy'] = shannon_entropy(lbp.astype(np.uint8))
-            
+            # 分块计算直方图
+            for i in range(n_blocks[0]):
+                for j in range(n_blocks[1]):
+                    # 提取当前块
+                    block = lbp_image[i*block_h:(i+1)*block_h, j*block_w:(j+1)*block_w]
+                    
+                    # 计算当前块的直方图 (18 bins for uniform LBP)
+                    hist, _ = np.histogram(block.ravel(), bins=np.arange(0, n_points+3), 
+                                         range=(0, n_points+2), density=True)
+                    
+                    # 为每个块的每个bin创建特征名
+                    for bin_idx, hist_val in enumerate(hist):
+                        features[f'block_lbp_{i}_{j}_bin_{bin_idx}'] = hist_val
+        
+            # 添加全局统计量
+            features['global_lbp_mean'] = np.mean(lbp_image)
+            features['global_lbp_std'] = np.std(lbp_image)
+            features['global_lbp_entropy'] = shannon_entropy(lbp_image.astype(np.uint8))
+        
+            # 添加块间统计特征
+            block_means = []
+            for i in range(n_blocks[0]):
+                for j in range(n_blocks[1]):
+                    block = lbp_image[i*block_h:(i+1)*block_h, j*block_w:(j+1)*block_w]
+                    block_means.append(np.mean(block))
+        
+            features['block_lbp_mean_var'] = np.var(block_means)  # 块间均值方差
+            features['block_lbp_mean_range'] = np.max(block_means) - np.min(block_means)  # 块间均值范围
+        
         except Exception as e:
-            print(f"LBP计算错误: {e}")
+            print(f"分块LBP计算错误: {e}")
+            # 返回默认值
+            total_bins = n_blocks[0] * n_blocks[1] * (n_points + 2)
+            for i in range(total_bins):
+                features[f'block_lbp_feature_{i}'] = 0.0
+            features['global_lbp_mean'] = 0.0
+            features['global_lbp_std'] = 0.0
+            features['global_lbp_entropy'] = 0.0
+            features['block_lbp_mean_var'] = 0.0
+            features['block_lbp_mean_range'] = 0.0
+        
+        return features
+
+    def extract_texture_features(self, image):
+        """提取纹理特征 - 使用分块LBP替代原有纹理特征"""
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+        
+        features = {}
+        
+        # 使用分块LBP特征替代原有的GLCM和LBP特征
+        block_lbp_features = self.extract_block_lbp_features(image, n_blocks=(4, 4))
+        features.update(block_lbp_features)
+        
+        # 可选：保留一些简单的纹理特征作为补充
+        # 梯度特征
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        features['gradient_mean'] = np.mean(gradient_magnitude)
+        features['gradient_std'] = np.std(gradient_magnitude)
+        features['gradient_max'] = np.max(gradient_magnitude)
         
         return features
     
