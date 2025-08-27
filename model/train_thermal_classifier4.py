@@ -5,11 +5,12 @@ from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as T
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import os
 import random
 import numpy as np
+import cv2
 from typing import Tuple, List, Dict, Optional
 from pathlib import Path
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
@@ -18,35 +19,281 @@ from datetime import datetime  # 添加这个导入
 import matplotlib.pyplot as plt  # 添加这个导入
 
 # ======================================================================================
-# 模块1: 面部分割 (复用train_siamese.py)
+# 模块1: 面部分割和Mask生成
 # ======================================================================================
 
 def preprocess_and_split_face(
-    image: Image.Image, 
+    image: Image.Image,
     output_size: Tuple[int, int] = (224, 112)
 ) -> Optional[Tuple[Image.Image, Image.Image]]:
     """直接对已裁剪的人脸图像进行左右分割"""
     width, height = image.size
     center_x = width // 2
-    
+
     left_half = image.crop((0, 0, center_x, height))
     right_half = image.crop((center_x, 0, width, height))
-    
+
     if left_half.size[0] == 0 or right_half.size[0] == 0:
         return None
-        
+
     return left_half, right_half
+
+def generate_face_mask(image_size: Tuple[int, int], mask_type: str = "ellipse", image: np.ndarray = None) -> np.ndarray:
+    """生成人脸区域mask
+
+    Args:
+        image_size: (width, height) 图像尺寸
+        mask_type: mask类型 ("ellipse", "rectangle", "adaptive", "content_based")
+        image: 可选的图像数组，用于基于内容的mask生成
+
+    Returns:
+        mask: 二值mask，1表示人脸区域，0表示背景
+    """
+    width, height = image_size
+    mask = np.zeros((height, width), dtype=np.float32)
+
+    if mask_type == "content_based" and image is not None:
+        # 基于图像内容的自适应mask（利用黑色背景特性）
+        mask = generate_content_based_mask(image)
+
+    elif mask_type == "ellipse":
+        # 椭圆形mask，覆盖大部分人脸区域
+        center_x, center_y = width // 2, height // 2
+        # 椭圆参数：稍微保守一些，避免包含太多背景
+        a = int(width * 0.35)  # 水平半轴
+        b = int(height * 0.4)  # 垂直半轴
+
+        y, x = np.ogrid[:height, :width]
+        ellipse_mask = ((x - center_x) / a) ** 2 + ((y - center_y) / b) ** 2 <= 1
+        mask[ellipse_mask] = 1.0
+
+    elif mask_type == "rectangle":
+        # 矩形mask，中心区域
+        margin_x = int(width * 0.15)
+        margin_y = int(height * 0.1)
+        mask[margin_y:height-margin_y, margin_x:width-margin_x] = 1.0
+
+    elif mask_type == "adaptive":
+        # 自适应mask，基于图像内容
+        # 这里简化为椭圆+矩形的组合
+        center_x, center_y = width // 2, height // 2
+
+        # 椭圆核心区域
+        a = int(width * 0.3)
+        b = int(height * 0.35)
+        y, x = np.ogrid[:height, :width]
+        ellipse_mask = ((x - center_x) / a) ** 2 + ((y - center_y) / b) ** 2 <= 1
+        mask[ellipse_mask] = 1.0
+
+        # 扩展矩形区域
+        margin_x = int(width * 0.2)
+        margin_y = int(height * 0.15)
+        rect_mask = np.zeros_like(mask)
+        rect_mask[margin_y:height-margin_y, margin_x:width-margin_x] = 0.5
+
+        # 组合mask
+        mask = np.maximum(mask, rect_mask)
+
+    return mask
+
+def generate_content_based_mask(image: np.ndarray, threshold: float = 0.1,
+                               morphology_ops: bool = True, smooth: bool = True) -> np.ndarray:
+    """基于图像内容生成人脸mask（利用黑色背景特性）
+
+    Args:
+        image: 输入图像 [H, W, C] 或 [C, H, W] 或 [H, W]
+        threshold: 阈值，用于区分前景和背景
+        morphology_ops: 是否应用形态学操作
+        smooth: 是否平滑mask边缘
+
+    Returns:
+        mask: 二值mask，1表示人脸区域，0表示背景
+    """
+    try:
+        # 处理不同的图像格式
+        if len(image.shape) == 3:
+            if image.shape[0] <= 3:  # [C, H, W] format
+                img_gray = np.mean(image, axis=0)
+            else:  # [H, W, C] format
+                img_gray = np.mean(image, axis=2)
+        else:  # [H, W] format
+            img_gray = image.copy()
+
+        # 确保是float类型
+        img_gray = img_gray.astype(np.float32)
+
+        # 归一化到[0, 1]
+        if img_gray.max() > 1.0:
+            img_gray = img_gray / 255.0
+
+        # 基于阈值生成初始mask
+        initial_mask = (img_gray > threshold).astype(np.float32)
+
+        if morphology_ops:
+            # 应用形态学操作去除噪声和填充空洞
+            try:
+                from scipy import ndimage
+
+                # 去除小的噪声点
+                initial_mask = ndimage.binary_opening(initial_mask, structure=np.ones((3, 3)))
+
+                # 填充小的空洞
+                initial_mask = ndimage.binary_closing(initial_mask, structure=np.ones((5, 5)))
+
+                # 进一步填充较大的空洞
+                initial_mask = ndimage.binary_fill_holes(initial_mask)
+
+                # 找到最大连通区域（假设人脸是最大的前景区域）
+                labeled_mask, num_features = ndimage.label(initial_mask)
+                if num_features > 0:
+                    # 计算每个连通区域的大小
+                    sizes = ndimage.sum(initial_mask, labeled_mask, range(num_features + 1))
+                    # 找到最大的连通区域（排除背景）
+                    max_label = np.argmax(sizes[1:]) + 1
+                    face_mask = (labeled_mask == max_label).astype(np.float32)
+                else:
+                    face_mask = initial_mask
+
+            except ImportError:
+                # 如果scipy不可用，使用简单的处理
+                print("警告: scipy不可用，使用简化的形态学处理")
+                face_mask = initial_mask
+        else:
+            face_mask = initial_mask
+
+        if smooth:
+            # 平滑mask边缘
+            try:
+                from scipy.ndimage import gaussian_filter
+                face_mask = gaussian_filter(face_mask.astype(np.float32), sigma=1.0)
+                # 重新二值化，但保留一些软边缘
+                face_mask = np.clip(face_mask, 0, 1)
+            except ImportError:
+                # 如果scipy不可用，跳过平滑
+                print("警告: scipy不可用，跳过mask平滑")
+                pass
+
+        return face_mask.astype(np.float32)
+
+    except Exception as e:
+        print(f"内容检测mask生成失败: {e}")
+        # 返回一个简单的中心区域mask作为回退
+        height, width = _get_image_dimensions(image)
+        center_mask = np.zeros((height, width), dtype=np.float32)
+        center_y, center_x = height // 2, width // 2
+        y, x = np.ogrid[:height, :width]
+        circle_mask = ((x - center_x)**2 + (y - center_y)**2) <= (min(height, width) * 0.3)**2
+        center_mask[circle_mask] = 1.0
+        return center_mask
+
+def generate_smart_face_mask(image: np.ndarray, fallback_type: str = "ellipse") -> np.ndarray:
+    """智能生成人脸mask，优先使用内容检测，失败时回退到几何形状
+
+    Args:
+        image: 输入图像 [H, W, C] 或 [H, W] 或 PIL Image array
+        fallback_type: 回退的mask类型
+
+    Returns:
+        mask: 生成的mask [H, W]
+    """
+    try:
+        # 处理PIL Image转换的numpy数组
+        if isinstance(image, np.ndarray):
+            if image.dtype == np.uint8:
+                image = image.astype(np.float32) / 255.0
+
+        # 尝试基于内容生成mask
+        content_mask = generate_content_based_mask(image)
+
+        # 验证mask质量
+        mask_coverage = np.mean(content_mask)
+
+        # 如果mask覆盖率在合理范围内，使用内容mask
+        if 0.05 < mask_coverage < 0.85:  # 放宽范围，适应不同图像
+            return content_mask
+        else:
+            # 覆盖率异常，使用几何形状作为回退
+            height, width = _get_image_dimensions(image)
+            # print(f"内容检测覆盖率异常({mask_coverage:.3f})，回退到{fallback_type}形状")  # 减少输出
+            return generate_face_mask((width, height), fallback_type)
+
+    except Exception as e:
+        print(f"内容检测失败，使用几何形状: {e}")
+        # 发生错误时使用几何形状
+        height, width = _get_image_dimensions(image)
+        return generate_face_mask((width, height), fallback_type)
+
+def _get_image_dimensions(image: np.ndarray) -> tuple:
+    """获取图像尺寸，处理不同的数组格式"""
+    if len(image.shape) == 3:
+        if image.shape[0] <= 3:  # [C, H, W]
+            height, width = image.shape[1], image.shape[2]
+        else:  # [H, W, C]
+            height, width = image.shape[0], image.shape[1]
+    else:  # [H, W]
+        height, width = image.shape
+
+    return height, width
+
+def apply_mask_to_image(image: np.ndarray, mask: np.ndarray, background_value: float = 0.0) -> np.ndarray:
+    """将mask应用到图像上
+
+    Args:
+        image: 输入图像 [C, H, W] 或 [H, W, C]
+        mask: 二值mask [H, W]
+        background_value: 背景区域的填充值
+
+    Returns:
+        masked_image: 应用mask后的图像
+    """
+    if len(image.shape) == 3:
+        if image.shape[0] <= 3:  # [C, H, W] format
+            masked_image = image.copy()
+            for c in range(image.shape[0]):
+                masked_image[c] = image[c] * mask + background_value * (1 - mask)
+        else:  # [H, W, C] format
+            masked_image = image.copy()
+            for c in range(image.shape[2]):
+                masked_image[:, :, c] = image[:, :, c] * mask + background_value * (1 - mask)
+    else:  # [H, W] format
+        masked_image = image * mask + background_value * (1 - mask)
+
+    return masked_image
+
+def create_attention_mask(image: torch.Tensor, mask_type: str = "ellipse") -> torch.Tensor:
+    """为batch图像创建attention mask
+
+    Args:
+        image: 输入图像tensor [B, C, H, W]
+        mask_type: mask类型
+
+    Returns:
+        attention_mask: [B, 1, H, W] 的attention mask
+    """
+    B, C, H, W = image.shape
+    masks = []
+
+    for i in range(B):
+        mask = generate_face_mask((W, H), mask_type)
+        masks.append(torch.from_numpy(mask).float())
+
+    attention_mask = torch.stack(masks, dim=0).unsqueeze(1)  # [B, 1, H, W]
+    return attention_mask.to(image.device)
 
 # ======================================================================================
 # 模块2: 对比学习数据集
 # ======================================================================================
 
 class ContrastiveThermalDataset(Dataset):
-    def __init__(self, root_dir: str, transform: T.Compose, mode: str = 'train', use_asymmetry_analysis: bool = False):
+    def __init__(self, root_dir: str, transform: T.Compose, mode: str = 'train',
+                 use_asymmetry_analysis: bool = False, use_face_mask: bool = True,
+                 mask_type: str = "ellipse"):
         self.root_dir = Path(root_dir)
         self.transform = transform
         self.mode = mode
-        self.use_asymmetry_analysis = use_asymmetry_analysis  # 添加这个属性
+        self.use_asymmetry_analysis = use_asymmetry_analysis
+        self.use_face_mask = use_face_mask  # 是否使用人脸mask
+        self.mask_type = mask_type  # mask类型
         self.class_to_images: Dict[str, List[str]] = self._find_classes()
         self.classes = list(self.class_to_images.keys())
         
@@ -71,7 +318,7 @@ class ContrastiveThermalDataset(Dataset):
 
     def __len__(self) -> int:
         if self.mode == 'contrastive':
-            return len(self.classes) * 200  # 增加到200，每轮400个对比对
+            return len(self.classes) * 400  # 增加到200，每轮400个对比对
         else:
             return len(self.image_paths)
 
@@ -139,38 +386,102 @@ class ContrastiveThermalDataset(Dataset):
         return img, torch.tensor(label, dtype=torch.long)
 
     def _process_image(self, img_path: str) -> Optional[torch.Tensor]:
-        """处理单张图像 - 改进版本"""
+        """处理单张图像 - 添加智能mask支持，修复尺寸不匹配问题"""
         try:
             face_img = Image.open(img_path).convert("RGB")
-        
+
             if self.use_asymmetry_analysis:
                 # 如果需要分析不对称性
                 halves = preprocess_and_split_face(face_img)
                 if halves is None:
                     return None
                 left_half, right_half = halves
-            
-                # 方案1: 拼接左右脸
-                left_tensor = self.transform(left_half)
-                right_tensor = self.transform(right_half)
+
+                # 如果使用mask，先生成mask再应用变换
+                if self.use_face_mask:
+                    if self.mask_type == "content_based":
+                        # 使用智能mask生成（基于原始尺寸）
+                        left_mask = generate_smart_face_mask(np.array(left_half), "ellipse")
+                        right_mask = generate_smart_face_mask(np.array(right_half), "ellipse")
+                    else:
+                        # 使用几何形状mask（基于原始尺寸）
+                        left_mask = generate_face_mask(left_half.size, self.mask_type)
+                        right_mask = generate_face_mask(right_half.size, self.mask_type)
+
+                    # 将mask应用到PIL图像
+                    left_half_masked = self._apply_mask_to_pil_image(left_half, left_mask)
+                    right_half_masked = self._apply_mask_to_pil_image(right_half, right_mask)
+
+                    # 应用变换
+                    left_tensor = self.transform(left_half_masked)
+                    right_tensor = self.transform(right_half_masked)
+                else:
+                    # 直接应用变换
+                    left_tensor = self.transform(left_half)
+                    right_tensor = self.transform(right_half)
+
                 # 在通道维度拼接 (3+3=6通道)
                 return torch.cat([left_tensor, right_tensor], dim=0)
             else:
                 # 直接使用完整人脸进行分类
-                return self.transform(face_img)
+                if self.use_face_mask:
+                    if self.mask_type == "content_based":
+                        # 使用智能mask生成（基于原始尺寸）
+                        face_mask = generate_smart_face_mask(np.array(face_img), "ellipse")
+                    else:
+                        # 使用几何形状mask（基于原始尺寸）
+                        face_mask = generate_face_mask(face_img.size, self.mask_type)
+
+                    # 将mask应用到PIL图像
+                    face_img_masked = self._apply_mask_to_pil_image(face_img, face_mask)
+
+                    # 应用变换
+                    img_tensor = self.transform(face_img_masked)
+                else:
+                    # 直接应用变换
+                    img_tensor = self.transform(face_img)
+
+                return img_tensor
         except Exception as e:
             print(f"图像处理错误 {img_path}: {e}")
             return None
+
+    def _apply_mask_to_pil_image(self, pil_image: Image.Image, mask: np.ndarray) -> Image.Image:
+        """将mask应用到PIL图像，返回masked的PIL图像"""
+        try:
+            # 转换PIL图像到numpy
+            img_array = np.array(pil_image).astype(np.float32) / 255.0
+
+            # 确保mask尺寸匹配
+            if mask.shape != img_array.shape[:2]:
+                # 使用PIL的resize来调整mask尺寸，更兼容
+                mask_pil = Image.fromarray((mask * 255).astype(np.uint8), mode='L')
+                mask_pil = mask_pil.resize(pil_image.size, Image.BILINEAR)
+                mask = np.array(mask_pil).astype(np.float32) / 255.0
+
+            # 应用mask
+            for c in range(img_array.shape[2]):
+                img_array[:, :, c] = img_array[:, :, c] * mask
+
+            # 转换回PIL图像
+            img_array = (img_array * 255).astype(np.uint8)
+            return Image.fromarray(img_array)
+
+        except Exception as e:
+            print(f"Mask应用失败，返回原图: {e}")
+            return pil_image
 
 # ======================================================================================
 # 模块3: 孪生网络编码器
 # ======================================================================================
 
 class ThermalEncoder(nn.Module):
-    """热力图特征编码器"""
-    def __init__(self, backbone: str = 'resnet18', feature_dim: int = 512):
+    """热力图特征编码器 - 添加attention机制"""
+    def __init__(self, backbone: str = 'resnet18', feature_dim: int = 512, use_attention: bool = True):
         super(ThermalEncoder, self).__init__()
-        
+
+        self.use_attention = use_attention
+
         if backbone == 'resnet18':
             self.backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
             backbone_dim = self.backbone.fc.in_features
@@ -181,14 +492,23 @@ class ThermalEncoder(nn.Module):
             self.backbone.fc = nn.Identity()
         else:
             raise ValueError("Unsupported backbone")
-        
+
+        # Attention模块 - 适配224x224输入
+        if self.use_attention:
+            self.attention_conv = nn.Sequential(
+                nn.Conv2d(512, 256, kernel_size=3, padding=1),  # ResNet18最后一层是512通道
+                nn.ReLU(),
+                nn.Conv2d(256, 1, kernel_size=1),
+                nn.Sigmoid()
+            )
+
         # 投影头用于对比学习
         self.projection_head = nn.Sequential(
             nn.Linear(backbone_dim, feature_dim),
             nn.ReLU(),
             nn.Linear(feature_dim, feature_dim)
         )
-        
+
         # 分类头
         self.classifier = nn.Sequential(
             nn.Dropout(0.3),
@@ -198,20 +518,45 @@ class ThermalEncoder(nn.Module):
             nn.Linear(256, 2)  # 二分类
         )
 
-    def forward(self, x, return_features=False):
-        features = self.backbone(x)
-        
+    def forward(self, x, attention_mask=None, return_features=False):
+        # 简化的前向传播，因为mask已经在数据预处理阶段应用
+        # attention_mask参数保留以保持接口兼容性，但实际不使用
+
+        # 通过backbone的各层
+        x_conv = x
+        x_conv = self.backbone.conv1(x_conv)
+        x_conv = self.backbone.bn1(x_conv)
+        x_conv = self.backbone.relu(x_conv)
+        x_conv = self.backbone.maxpool(x_conv)
+
+        x_conv = self.backbone.layer1(x_conv)
+        x_conv = self.backbone.layer2(x_conv)
+        x_conv = self.backbone.layer3(x_conv)
+        x_conv = self.backbone.layer4(x_conv)  # [B, 512, H', W']
+
+        # 应用attention机制（如果启用）
+        if self.use_attention:
+            # 生成attention map，基于特征自适应
+            attention_weights = self.attention_conv(x_conv)  # [B, 1, H', W']
+            # 应用attention
+            x_conv = x_conv * attention_weights
+
+        # 全局平均池化
+        features = self.backbone.avgpool(x_conv)
+        features = torch.flatten(features, 1)
+
         if return_features:
             return features
-        
+
         # 对比学习时返回投影特征
         projected = self.projection_head(features)
         # 确保L2归一化
         return F.normalize(projected, p=2, dim=1)
-    
-    def classify(self, x):
+
+    def classify(self, x, attention_mask=None):
         """分类任务的前向传播"""
-        features = self.backbone(x)
+        # attention_mask参数保留以保持接口兼容性，但实际不使用
+        features = self.forward(x, attention_mask, return_features=True)
         return self.classifier(features)
 
 # ======================================================================================
@@ -398,12 +743,16 @@ class AdaptiveContrastiveLoss(nn.Module):
 # ======================================================================================
 
 class ContrastiveThermalClassifier:
-    def __init__(self, data_dir: str, output_dir: str = "./model/contrastive_thermal_results", 
-                 use_asymmetry_analysis: bool = False, pretrained_encoder_path: str = None):
+    def __init__(self, data_dir: str, output_dir: str = "./model/contrastive_thermal_results",
+                 use_asymmetry_analysis: bool = False, pretrained_encoder_path: str = None,
+                 use_face_mask: bool = True, mask_type: str = "ellipse", use_attention: bool = True):
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.use_asymmetry_analysis = use_asymmetry_analysis
-        self.pretrained_encoder_path = pretrained_encoder_path  # 新增参数
+        self.pretrained_encoder_path = pretrained_encoder_path
+        self.use_face_mask = use_face_mask  # 是否使用人脸mask
+        self.mask_type = mask_type  # mask类型
+        self.use_attention = use_attention  # 是否使用attention机制
         
         # 创建带时间戳的运行目录
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -412,22 +761,26 @@ class ContrastiveThermalClassifier:
         
         print(f"结果将保存到: {self.run_dir}")
         print(f"不对称分析: {'启用' if use_asymmetry_analysis else '禁用'}")
-        
+        print(f"人脸Mask: {'启用' if use_face_mask else '禁用'}")
+        if use_face_mask:
+            print(f"Mask类型: {mask_type}")
+        print(f"Attention机制: {'启用' if use_attention else '禁用'}")
+
         if pretrained_encoder_path:
             print(f"将使用预训练编码器: {pretrained_encoder_path}")
-        
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        # 根据是否使用不对称分析调整尺寸
+        # 根据是否使用不对称分析调整尺寸 - 保持与脚本3相同的参数
         if use_asymmetry_analysis:
             resize_size = (224, 112)  # 半脸分析
             print("使用半脸分析模式，图像尺寸: (224, 112)")
         else:
             resize_size = (224, 224)  # 完整人脸
             print("使用完整人脸模式，图像尺寸: (224, 224)")
-        
-        # 数据变换
+
+        # 数据变换 - 与脚本3保持一致
         self.transform = T.Compose([
             T.Resize(resize_size),
             T.ToTensor(),
@@ -441,15 +794,17 @@ class ContrastiveThermalClassifier:
         
         # 创建对比学习数据集
         dataset = ContrastiveThermalDataset(
-            self.data_dir, 
-            self.transform, 
+            self.data_dir,
+            self.transform,
             mode='contrastive',
-            use_asymmetry_analysis=self.use_asymmetry_analysis  # 添加这个参数
+            use_asymmetry_analysis=self.use_asymmetry_analysis,
+            use_face_mask=self.use_face_mask,
+            mask_type=self.mask_type
         )
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
         
         # 创建模型
-        model = ThermalEncoder(backbone='resnet18').to(self.device)
+        model = ThermalEncoder(backbone='resnet18', use_attention=self.use_attention).to(self.device)
         # 根据不对称分析调整模型结构
         if self.use_asymmetry_analysis:
             # 调整第一层卷积为6通道输入
@@ -486,12 +841,17 @@ class ContrastiveThermalClassifier:
             
             for batch_idx, (img1, img2, labels) in enumerate(dataloader):
                 img1, img2, labels = img1.to(self.device), img2.to(self.device), labels.to(self.device)
-                
+
                 optimizer.zero_grad()
-                
+
+                # 对比学习阶段：不使用动态attention_mask
+                # 因为mask已经在数据预处理阶段应用了，保持数据处理的一致性
+                attention_mask1 = None
+                attention_mask2 = None
+
                 # 获取特征
-                feat1 = model(img1)
-                feat2 = model(img2)                
+                feat1 = model(img1, attention_mask1)
+                feat2 = model(img2, attention_mask2)
                 # 原来的监控信息
                 with torch.no_grad():
                     feat1_norm = torch.norm(feat1, p=2, dim=1).mean()
@@ -580,7 +940,12 @@ class ContrastiveThermalClassifier:
         print("=== 第二阶段：微调分类器 ===")
         
         # 准备分类数据集
-        full_dataset = ContrastiveThermalDataset(self.data_dir, self.transform, mode='classification', use_asymmetry_analysis=self.use_asymmetry_analysis)
+        full_dataset = ContrastiveThermalDataset(
+            self.data_dir, self.transform, mode='classification',
+            use_asymmetry_analysis=self.use_asymmetry_analysis,
+            use_face_mask=self.use_face_mask,
+            mask_type=self.mask_type
+        )
         
         # 检查数据分布
         all_labels = [full_dataset[i][1] for i in range(len(full_dataset))]
@@ -628,7 +993,7 @@ class ContrastiveThermalClassifier:
         if pretrained_encoder is not None:
             model = pretrained_encoder
         else:
-            model = ThermalEncoder(backbone='resnet18').to(self.device)
+            model = ThermalEncoder(backbone='resnet18', use_attention=self.use_attention).to(self.device)
             
             # 如果使用不对称分析，需要调整模型结构
             if self.use_asymmetry_analysis:
@@ -716,9 +1081,13 @@ class ContrastiveThermalClassifier:
             
             for img, labels in train_loader:
                 img, labels = img.to(self.device), labels.to(self.device)
-                
+
+                # 分类训练阶段：不使用动态attention_mask
+                # 因为mask已经在数据预处理阶段应用了，保持与对比学习阶段的一致性
+                attention_mask = None
+
                 optimizer.zero_grad()
-                outputs = model.classify(img)
+                outputs = model.classify(img, attention_mask)
                 loss = criterion(outputs, labels)
                 loss.backward()
                 
@@ -738,7 +1107,12 @@ class ContrastiveThermalClassifier:
             with torch.no_grad():
                 for img, labels in val_loader:
                     img, labels = img.to(self.device), labels.to(self.device)
-                    outputs = model.classify(img)
+
+                    # 分类验证阶段：不使用动态attention_mask
+                    # 因为mask已经在数据预处理阶段应用了，保持与训练阶段的一致性
+                    attention_mask = None
+
+                    outputs = model.classify(img, attention_mask)
                     loss = criterion(outputs, labels)
                     val_loss += loss.item()
                     
@@ -813,7 +1187,12 @@ class ContrastiveThermalClassifier:
         with torch.no_grad():
             for img, labels in test_loader:
                 img, labels = img.to(self.device), labels.to(self.device)
-                outputs = model.classify(img)
+
+                # 分类测试阶段：不使用动态attention_mask
+                # 因为mask已经在数据预处理阶段应用了，保持与训练阶段的一致性
+                attention_mask = None
+
+                outputs = model.classify(img, attention_mask)
                 probs = F.softmax(outputs, dim=1)
                 
                 _, predicted = torch.max(outputs, 1)
@@ -922,7 +1301,7 @@ class ContrastiveThermalClassifier:
         if skip_contrastive and self.pretrained_encoder_path:
             # 跳过对比学习，直接加载预训练编码器
             print("=== 跳过对比学习阶段，加载预训练编码器 ===")
-            encoder = ThermalEncoder(backbone='resnet18').to(self.device)
+            encoder = ThermalEncoder(backbone='resnet18', use_attention=self.use_attention).to(self.device)
             
             # 根据use_asymmetry_analysis调整模型结构
             if self.use_asymmetry_analysis:
@@ -1067,19 +1446,38 @@ def main():
     data_dir = "./dataset/datasets/thermal_classification_cropped"
     output_dir = "./model/contrastive_thermal_classifier_results"
     
-    # 选项1: 完整训练（对比学习 + 分类）
-    classifier = ContrastiveThermalClassifier(data_dir, output_dir, use_asymmetry_analysis=False)
-    model, results = classifier.run_full_training(skip_contrastive=False)
-    
+    # 选项1: 完整训练（对比学习 + 分类）- 使用智能人脸mask和attention
+    # classifier = ContrastiveThermalClassifier(
+    #     data_dir, output_dir,
+    #     use_asymmetry_analysis=False,  # 标准模式
+    #     use_face_mask=True,           # 启用人脸mask
+    #     mask_type="content_based",    # 基于内容的智能mask
+    #     use_attention=True            # 启用attention机制
+    # )
+    # model, results = classifier.run_full_training(skip_contrastive=False)
+
     # 选项2: 只进行分类微调（需要指定预训练编码器路径）
-    # pretrained_path = "./model/contrastive_thermal_classifier_results/run_20250826_234950__/best_contrastive_encoder.pth"
-    # classifier = ContrastiveThermalClassifier(data_dir, output_dir, pretrained_encoder_path=pretrained_path, use_asymmetry_analysis=True)
-    # model, results = classifier.run_full_training(skip_contrastive=True)
-    
+    pretrained_path = "./model/contrastive_thermal_classifier_results/run_20250828_002221/best_contrastive_encoder.pth"
+    classifier = ContrastiveThermalClassifier(
+        data_dir, output_dir,
+        pretrained_encoder_path=pretrained_path,
+        use_asymmetry_analysis=False,
+        use_face_mask=True,
+        mask_type="content_based",
+        use_attention=True
+    )
+    model, results = classifier.run_full_training(skip_contrastive=True)
+
     print(f"\n=== 最终结果 ===")
     print(f"测试准确率: {results['accuracy']:.4f}")
     print(f"测试F1分数: {results['f1']:.4f}")
     print(f"测试AUC: {results['auc']:.4f}")
+
+    print(f"\n=== 训练配置 ===")
+    print(f"人脸Mask: {'启用' if classifier.use_face_mask else '禁用'}")
+    print(f"Mask类型: {classifier.mask_type}")
+    print(f"Attention机制: {'启用' if classifier.use_attention else '禁用'}")
+    print(f"不对称分析: {'启用' if classifier.use_asymmetry_analysis else '禁用'}")
 
 if __name__ == "__main__":
     main()
