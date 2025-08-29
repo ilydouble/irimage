@@ -98,22 +98,29 @@ class FocalLossClassifier:
         return params
 
 class ThermalFeatureExtractor:
-    def __init__(self, data_dir="./dataset/datasets/thermal_classification_cropped", 
-                 output_dir="./model/thermal_feature_classifier_results"):
+    def __init__(self, data_dir="./dataset/datasets/thermal_classification_cropped",
+                 output_dir="./results/training_results/thermal_feature_classifier_results"):
         self.data_dir = Path(data_dir)
-        self.output_dir = Path(output_dir)
-        
-        # 创建带时间戳的输出目录
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = self.output_dir / f"run_{timestamp}"
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.base_output_dir = Path(output_dir)
         
         # 类别映射
         self.class_to_idx = {'non_icas': 0, 'icas': 1}
         self.idx_to_class = {0: 'non_icas', 1: 'icas'}
-        
+
         print(f"数据目录: {self.data_dir}")
-        print(f"输出目录: {self.run_dir}")
+        print(f"基础输出目录: {self.base_output_dir}")
+
+    def create_descriptive_output_dir(self, best_model_name, focal_alpha, focal_gamma):
+        """创建描述性的输出目录"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 格式: FEATURE-RF-FOCAL-A0.25-G2.0-20240829_143022
+        folder_name = f"FEATURE-{best_model_name.upper()}-FOCAL-A{focal_alpha}-G{focal_gamma}-{timestamp}"
+
+        output_dir = self.base_output_dir / folder_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        return output_dir
     
     def extract_temperature_features(self, image):
         """提取温度特征"""
@@ -722,10 +729,16 @@ class ThermalFeatureExtractor:
         # 4. 评估最佳模型
         best_model_name, best_model, test_results = self.evaluate_best_model(
             trained_models, results, X_test, y_test)
-        
+
+        # 创建描述性输出目录
+        self.run_dir = self.create_descriptive_output_dir(
+            best_model_name, config['focal_loss_alpha'], config['focal_loss_gamma']
+        )
+        print(f"输出目录: {self.run_dir}")
+
         total_time = time.time() - start_time
         config['total_training_time'] = total_time
-        
+
         # 5. 保存结果
         self.save_results(results, test_results, feature_columns, config)
         

@@ -104,18 +104,16 @@ class ThermalDataset(Dataset):
         return image, label
 
 class ThermalClassifier:
-    def __init__(self, data_dir="./dataset/datasets/thermal_classification_cropped", 
-                 output_dir="./model/thermal_classifier_results"):
+    def __init__(self, data_dir="./dataset/datasets/thermal_classification_cropped",
+                 output_dir="./results/training_results/thermal_classifier_results"):
         self.data_dir = Path(data_dir)
-        
-        # 创建带编号的输出目录
-        self.output_dir = self.create_numbered_output_dir(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.base_output_dir = Path(output_dir)
+        # 输出目录将在run_training中根据参数创建
         
         # 设备配置
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"使用设备: {self.device}")
-        print(f"输出目录: {self.output_dir}")
+        print(f"基础输出目录: {self.base_output_dir}")
         
         # 类别映射
         self.class_to_idx = {'non_icas': 0, 'icas': 1}
@@ -141,16 +139,21 @@ class ThermalClassifier:
                                std=[0.229, 0.224, 0.225])
         ])
     
-    def create_numbered_output_dir(self, base_dir):
-        """创建带编号的输出目录"""
-        base_path = Path(base_dir)
-        counter = 1
-        
-        while True:
-            numbered_dir = base_path / f"run_{counter:03d}"
-            if not numbered_dir.exists():
-                return numbered_dir
-            counter += 1
+    def create_descriptive_output_dir(self, backbone, batch_size, num_epochs, lr, use_focal_loss):
+        """创建描述性的输出目录"""
+        from datetime import datetime
+
+        # 构建描述性文件夹名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        loss_type = "focal" if use_focal_loss else "ce"  # ce = cross entropy
+
+        # 格式: CNN-ResNet18-Focal-E100-LR0.0001-B32-20240829_143022
+        folder_name = f"CNN-{backbone.upper()}-{loss_type.upper()}-E{num_epochs}-LR{lr}-B{batch_size}-{timestamp}"
+
+        output_dir = self.base_output_dir / folder_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        return output_dir
     
     def load_data(self):
         """加载数据并划分数据集"""
@@ -590,10 +593,31 @@ class ThermalClassifier:
         
         return results
     
-    def run_training(self, backbone='resnet18', batch_size=32, num_epochs=50, lr=0.001, 
+    def run_training(self, backbone='resnet18', batch_size=32, num_epochs=50, lr=0.001,
                     weight_decay=1e-4, patience=10, use_focal_loss=True):
         """运行完整的训练流程 - 添加Focal Loss选项"""
         print("=== 热力图ICAS分类模型训练 ===\n")
+
+        # 创建描述性输出目录
+        self.output_dir = self.create_descriptive_output_dir(backbone, batch_size, num_epochs, lr, use_focal_loss)
+        print(f"输出目录: {self.output_dir}")
+
+        # 保存训练配置
+        config = {
+            'backbone': backbone,
+            'batch_size': batch_size,
+            'num_epochs': num_epochs,
+            'learning_rate': lr,
+            'weight_decay': weight_decay,
+            'patience': patience,
+            'use_focal_loss': use_focal_loss,
+            'device': str(self.device),
+            'data_dir': str(self.data_dir),
+            'output_dir': str(self.output_dir)
+        }
+
+        with open(self.output_dir / 'config.json', 'w') as f:
+            json.dump(config, f, indent=2)
         
         # 1. 加载数据
         X_train, X_val, X_test, y_train, y_val, y_test = self.load_data()
@@ -630,12 +654,12 @@ def main():
     config = {
         'batch_size': 32,
         'num_epochs': 100,        # 增加最大轮数，让早停决定何时停止
-        'learning_rate': 0.001,
+        'learning_rate': 0.00001,
         'weight_decay': 1e-4,     # L2正则化
         'patience': 15,           # 早停耐心值
         'use_focal_loss': True,   # 使用Focal Loss
         'data_dir': './dataset/datasets/thermal_classification_cropped',
-        'output_dir': './model/thermal_classifier_results'
+        'output_dir': './results/training_results/thermal_classifier_results'
     }
     
     # 创建训练器
@@ -644,8 +668,9 @@ def main():
         output_dir=config['output_dir']
     )
     
-    # 开始训练
+    # 开始训练 - 可以选择不同的骨干网络
     results = classifier.run_training(
+        backbone='yolo11n',          # 🎯 选择骨干网络: 'resnet18', 'yolo11s', 'efficientnet_b0' 等
         batch_size=config['batch_size'],
         num_epochs=config['num_epochs'],
         lr=config['learning_rate'],

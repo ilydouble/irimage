@@ -7,7 +7,7 @@ import shutil
 class SegmentedRegionExtractor:
     def __init__(self, base_dir="./dataset/datasets"):
         self.base_dir = Path(base_dir)
-        self.output_dir = self.base_dir / "thermal_classification"
+        self.output_dir = self.base_dir / "thermal_classification_cropped"
         
         # 定义输入目录映射：原图目录 -> 预测结果目录
         self.input_mapping = {
@@ -70,7 +70,6 @@ class SegmentedRegionExtractor:
                     print(f"    跳过: 数据不足")
                     continue
                 
-                # 简单假设格式: class_id x1 y1 x2 y2 x3 y3 ...
                 try:
                     coords = [float(x) for x in parts[1:]]  # 跳过class_id
                     print(f"    原始坐标数量: {len(coords)}")
@@ -110,27 +109,85 @@ class SegmentedRegionExtractor:
         
         return mask
     
-    def apply_mask_to_image(self, image, mask):
-        """将掩码应用到图像，背景涂黑"""
+    def get_bounding_box_from_mask(self, mask):
+        """从掩码获取最小外接矩形"""
+        # 找到所有非零像素的坐标
+        coords = np.column_stack(np.where(mask > 0))
+        
+        if len(coords) == 0:
+            return None
+        
+        # 计算边界框
+        y_min, x_min = coords.min(axis=0)
+        y_max, x_max = coords.max(axis=0)
+        
+        return x_min, y_min, x_max, y_max
+    
+    def crop_foreground_region(self, image, mask, padding=20):
+        """截取前景区域，其他区域填充黑色"""
+        # 获取前景的边界框
+        bbox = self.get_bounding_box_from_mask(mask)
+        
+        if bbox is None:
+            print("    无法获取边界框，返回全黑图像")
+            return np.zeros((224, 224, 3), dtype=np.uint8)
+        
+        x_min, y_min, x_max, y_max = bbox
+        
+        # 添加padding
+        h, w = image.shape[:2]
+        x_min = max(0, x_min - padding)
+        y_min = max(0, y_min - padding)
+        x_max = min(w, x_max + padding)
+        y_max = min(h, y_max + padding)
+        
+        print(f"    边界框: ({x_min}, {y_min}) -> ({x_max}, {y_max})")
+        
+        # 截取区域
+        crop_width = x_max - x_min
+        crop_height = y_max - y_min
+        
+        if crop_width <= 0 or crop_height <= 0:
+            print("    边界框无效，返回全黑图像")
+            return np.zeros((224, 224, 3), dtype=np.uint8)
+        
+        # 创建裁剪后的图像和掩码
+        cropped_image = image[y_min:y_max, x_min:x_max]
+        cropped_mask = mask[y_min:y_max, x_min:x_max]
+        
         # 创建三通道掩码
-        mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) / 255.0
+        mask_3ch = cv2.cvtColor(cropped_mask, cv2.COLOR_GRAY2BGR) / 255.0
         
         # 应用掩码：保留掩码区域，其他区域涂黑
-        masked_image = image * mask_3ch
+        masked_image = cropped_image * mask_3ch
+        
+        print(f"    裁剪后尺寸: {masked_image.shape}")
         
         return masked_image.astype(np.uint8)
     
-    def find_original_image(self, source_dir, base_name):
-        """在原图目录中查找对应的图像"""
-        # 尝试不同的扩展名
-        extensions = ['.jpg', '.jpeg', '.png', '.bmp']
+    def resize_to_square(self, image, target_size=512):
+        """将图像调整为正方形，保持长宽比"""
+        h, w = image.shape[:2]
         
-        for ext in extensions:
-            img_path = source_dir / f"{base_name}{ext}"
-            if img_path.exists():
-                return img_path
+        # 计算缩放比例
+        scale = target_size / max(h, w)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
         
-        return None
+        # 缩放图像
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # 创建正方形画布（黑色背景）
+        square_image = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        
+        # 计算居中位置
+        y_offset = (target_size - new_h) // 2
+        x_offset = (target_size - new_w) // 2
+        
+        # 将缩放后的图像放置在画布中心
+        square_image[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+        
+        return square_image
     
     def find_prediction_label(self, result_dir, base_name):
         """在预测结果目录中查找对应的标签文件"""
@@ -192,17 +249,20 @@ class SegmentedRegionExtractor:
                     if not polygons:
                         print(f"  无有效分割区域: {base_name}")
                         # 如果没有检测到区域，创建全黑图像
-                        masked_image = np.zeros_like(image)
+                        cropped_image = np.zeros((512, 512, 3), dtype=np.uint8)
                     else:
                         # 创建掩码
                         mask = self.create_mask_from_polygons(polygons, image.shape)
                         
-                        # 应用掩码
-                        masked_image = self.apply_mask_to_image(image, mask)
+                        # 截取前景区域
+                        cropped_image = self.crop_foreground_region(image, mask, padding=20)
+                        
+                        # 调整为正方形
+                        cropped_image = self.resize_to_square(cropped_image, target_size=512)
                     
                     # 保存结果
                     output_path = self.output_dir / category / image_path.name
-                    cv2.imwrite(str(output_path), masked_image)
+                    cv2.imwrite(str(output_path), cropped_image)
                     
                     processed_count += 1
                     print(f"  处理完成: {image_path.name} -> {category}/{image_path.name}")
@@ -214,7 +274,7 @@ class SegmentedRegionExtractor:
     
     def extract_all_regions(self):
         """提取所有分割区域"""
-        print("开始提取分割区域...")
+        print("开始提取分割区域（截取模式）...")
         
         total_processed = 0
         
@@ -250,24 +310,6 @@ class SegmentedRegionExtractor:
             'icas': icas_count,
             'non_icas': non_icas_count
         }
-    
-    def visualize_sample(self, category="icas", num_samples=3):
-        """可视化一些样本结果"""
-        sample_dir = self.output_dir / category
-        if not sample_dir.exists():
-            print(f"样本目录不存在: {sample_dir}")
-            return
-        
-        images = list(sample_dir.glob("*.jpg"))[:num_samples]
-        
-        print(f"\n显示 {category} 类别的 {len(images)} 个样本:")
-        for img_path in images:
-            print(f"  {img_path.name}")
-            # 这里可以添加图像显示代码
-            # cv2.imshow(f"{category} - {img_path.name}", cv2.imread(str(img_path)))
-        
-        # cv2.waitKey(0)
-        # cv2.destroyAllWindows()
 
 def main():
     # 初始化提取器
@@ -276,12 +318,9 @@ def main():
     # 提取所有分割区域
     results = extractor.extract_all_regions()
     
-    # 可视化一些样本（可选）
-    # extractor.visualize_sample("icas", 3)
-    # extractor.visualize_sample("non_icas", 3)
-    
     print(f"\n脚本执行完成!")
-    print(f"分类数据集已准备完成，可用于后续的分类模型训练")
+    print(f"裁剪后的分类数据集已准备完成，可用于后续的分类模型训练")
+    print(f"数据集位置: {extractor.output_dir}")
 
 if __name__ == "__main__":
     main()

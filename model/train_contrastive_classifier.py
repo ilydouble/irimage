@@ -398,21 +398,16 @@ class AdaptiveContrastiveLoss(nn.Module):
 # ======================================================================================
 
 class ContrastiveThermalClassifier:
-    def __init__(self, data_dir: str, output_dir: str = "./model/contrastive_thermal_results", 
+    def __init__(self, data_dir: str, output_dir: str = "./results/training_results/contrastive_thermal_classifier_results",
                  use_asymmetry_analysis: bool = False, pretrained_encoder_path: str = None):
         self.data_dir = Path(data_dir)
-        self.output_dir = Path(output_dir)
+        self.base_output_dir = Path(output_dir)
         self.use_asymmetry_analysis = use_asymmetry_analysis
-        self.pretrained_encoder_path = pretrained_encoder_path  # 新增参数
-        
-        # 创建带时间戳的运行目录
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = self.output_dir / f"run_{timestamp}"
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        
-        print(f"结果将保存到: {self.run_dir}")
+        self.pretrained_encoder_path = pretrained_encoder_path
+
+        print(f"基础输出目录: {self.base_output_dir}")
         print(f"不对称分析: {'启用' if use_asymmetry_analysis else '禁用'}")
-        
+
         if pretrained_encoder_path:
             print(f"将使用预训练编码器: {pretrained_encoder_path}")
         
@@ -433,8 +428,20 @@ class ContrastiveThermalClassifier:
             T.ToTensor(),
             T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
-    
-    
+
+    def create_descriptive_output_dir(self, contrastive_epochs, classification_epochs, contrastive_lr, classification_lr, batch_size):
+        """创建描述性的输出目录"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 格式: CONTRASTIVE-E50+30-LR0.001+0.0001-B32-ASYM-20240829_143022
+        asymmetry_flag = "ASYM" if self.use_asymmetry_analysis else "FULL"
+        folder_name = f"CONTRASTIVE-E{contrastive_epochs}+{classification_epochs}-LR{contrastive_lr}+{classification_lr}-B{batch_size}-{asymmetry_flag}-{timestamp}"
+
+        output_dir = self.base_output_dir / folder_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        return output_dir
+
     def train_contrastive_encoder(self, epochs=50, batch_size=32, lr=0.001):
         """第一阶段：对比学习训练编码器"""
         print("=== 第一阶段：对比学习训练编码器 ===")
@@ -915,9 +922,27 @@ class ContrastiveThermalClassifier:
         plt.savefig(self.run_dir / 'roc_curve.png', dpi=300, bbox_inches='tight')
         plt.show()
 
-    def run_full_training(self, skip_contrastive=False):
+    def run_full_training(self, contrastive_epochs=50, classification_epochs=30,
+                         contrastive_lr=0.001, classification_lr=0.0001,
+                         batch_size=32, skip_contrastive=False):
         """运行完整的两阶段训练流程"""
         print("=== 开始完整训练流程 ===")
+
+        # 创建描述性输出目录
+        self.run_dir = self.create_descriptive_output_dir(
+            contrastive_epochs, classification_epochs,
+            contrastive_lr, classification_lr, batch_size
+        )
+        print(f"输出目录: {self.run_dir}")
+        print(f"对比学习轮数: {contrastive_epochs}")
+        print(f"分类训练轮数: {classification_epochs}")
+        print(f"对比学习学习率: {contrastive_lr}")
+        print(f"分类学习率: {classification_lr}")
+        print(f"批次大小: {batch_size}")
+        print(f"跳过对比学习: {skip_contrastive}")
+        print(f"使用预训练编码器: {self.pretrained_encoder_path is not None}")
+        print(f"不对称分析: {self.use_asymmetry_analysis}")
+        print("-" * 50)
         
         if skip_contrastive and self.pretrained_encoder_path:
             # 跳过对比学习，直接加载预训练编码器
@@ -946,11 +971,11 @@ class ContrastiveThermalClassifier:
         else:
             # 第一阶段：对比学习（只使用训练+验证集）
             print("=== 执行完整的两阶段训练 ===")
-            encoder = self.train_contrastive_encoder(epochs=100, batch_size=32, lr=0.00005)
-        
+            encoder = self.train_contrastive_encoder(epochs=contrastive_epochs, batch_size=batch_size, lr=contrastive_lr)
+
         # 第二阶段：分类微调（使用训练+验证集训练，测试集评估）
         print("=== 第二阶段：分类微调 ===")
-        model, test_results = self.train_classifier(encoder, epochs=30, batch_size=32, lr=0.00001)
+        model, test_results = self.train_classifier(encoder, epochs=classification_epochs, batch_size=batch_size, lr=classification_lr)
         
         
         return model, test_results
@@ -1065,11 +1090,18 @@ class ContrastiveThermalClassifier:
 def main():
     # 配置参数
     data_dir = "./dataset/datasets/thermal_classification_cropped"
-    output_dir = "./model/contrastive_thermal_classifier_results"
-    
+    output_dir = "./results/training_results/contrastive_thermal_classifier_results"
+
     # 选项1: 完整训练（对比学习 + 分类）
     classifier = ContrastiveThermalClassifier(data_dir, output_dir, use_asymmetry_analysis=False)
-    model, results = classifier.run_full_training(skip_contrastive=False)
+    model, results = classifier.run_full_training(
+        contrastive_epochs=50,
+        classification_epochs=30,
+        contrastive_lr=0.001,
+        classification_lr=0.0001,
+        batch_size=32,
+        skip_contrastive=False
+    )
     
     # 选项2: 只进行分类微调（需要指定预训练编码器路径）
     # pretrained_path = "./model/contrastive_thermal_classifier_results/run_20250826_234950__/best_contrastive_encoder.pth"

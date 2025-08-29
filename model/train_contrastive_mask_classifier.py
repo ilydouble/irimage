@@ -743,23 +743,18 @@ class AdaptiveContrastiveLoss(nn.Module):
 # ======================================================================================
 
 class ContrastiveThermalClassifier:
-    def __init__(self, data_dir: str, output_dir: str = "./model/contrastive_thermal_results",
+    def __init__(self, data_dir: str, output_dir: str = "./results/training_results/contrastive_thermal_classifier_results",
                  use_asymmetry_analysis: bool = False, pretrained_encoder_path: str = None,
                  use_face_mask: bool = True, mask_type: str = "ellipse", use_attention: bool = True):
         self.data_dir = Path(data_dir)
-        self.output_dir = Path(output_dir)
+        self.base_output_dir = Path(output_dir)
         self.use_asymmetry_analysis = use_asymmetry_analysis
         self.pretrained_encoder_path = pretrained_encoder_path
         self.use_face_mask = use_face_mask  # 是否使用人脸mask
         self.mask_type = mask_type  # mask类型
         self.use_attention = use_attention  # 是否使用attention机制
-        
-        # 创建带时间戳的运行目录
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = self.output_dir / f"run_{timestamp}"
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        
-        print(f"结果将保存到: {self.run_dir}")
+
+        print(f"基础输出目录: {self.base_output_dir}")
         print(f"不对称分析: {'启用' if use_asymmetry_analysis else '禁用'}")
         print(f"人脸Mask: {'启用' if use_face_mask else '禁用'}")
         if use_face_mask:
@@ -768,6 +763,22 @@ class ContrastiveThermalClassifier:
 
         if pretrained_encoder_path:
             print(f"将使用预训练编码器: {pretrained_encoder_path}")
+
+    def create_descriptive_output_dir(self, contrastive_epochs, classification_epochs, contrastive_lr, classification_lr, batch_size):
+        """创建描述性的输出目录"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 格式: CONTRASTIVE-MASK-ELLIPSE-ATT-E50+30-LR0.001+0.0001-B32-ASYM-20240829_143022
+        asymmetry_flag = "ASYM" if self.use_asymmetry_analysis else "FULL"
+        mask_flag = f"MASK-{self.mask_type.upper()}" if self.use_face_mask else "NOMASK"
+        attention_flag = "ATT" if self.use_attention else "NOATT"
+
+        folder_name = f"CONTRASTIVE-{mask_flag}-{attention_flag}-E{contrastive_epochs}+{classification_epochs}-LR{contrastive_lr}+{classification_lr}-B{batch_size}-{asymmetry_flag}-{timestamp}"
+
+        output_dir = self.base_output_dir / folder_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        return output_dir
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -1294,9 +1305,27 @@ class ContrastiveThermalClassifier:
         plt.savefig(self.run_dir / 'roc_curve.png', dpi=300, bbox_inches='tight')
         plt.show()
 
-    def run_full_training(self, skip_contrastive=False):
+    def run_full_training(self, contrastive_epochs=50, classification_epochs=30,
+                         contrastive_lr=0.001, classification_lr=0.0001,
+                         batch_size=32, skip_contrastive=False):
         """运行完整的两阶段训练流程"""
         print("=== 开始完整训练流程 ===")
+
+        # 创建描述性输出目录
+        self.run_dir = self.create_descriptive_output_dir(
+            contrastive_epochs, classification_epochs,
+            contrastive_lr, classification_lr, batch_size
+        )
+        print(f"输出目录: {self.run_dir}")
+        print(f"对比学习轮数: {contrastive_epochs}")
+        print(f"分类训练轮数: {classification_epochs}")
+        print(f"对比学习学习率: {contrastive_lr}")
+        print(f"分类学习率: {classification_lr}")
+        print(f"批次大小: {batch_size}")
+        print(f"跳过对比学习: {skip_contrastive}")
+        print(f"使用预训练编码器: {self.pretrained_encoder_path is not None}")
+        print(f"不对称分析: {self.use_asymmetry_analysis}")
+        print("-" * 50)
         
         if skip_contrastive and self.pretrained_encoder_path:
             # 跳过对比学习，直接加载预训练编码器

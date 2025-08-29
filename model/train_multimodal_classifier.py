@@ -100,26 +100,33 @@ class FocalLossClassifier:
         return params
 
 class MultiModalThermalClassifier:
-    def __init__(self, 
+    def __init__(self,
                  data_dir="./dataset/datasets/thermal_classification_cropped",
                  db_path="./web/database/patientcare.db",
-                 output_dir="./model/multimodal_thermal_classifier_results"):
+                 output_dir="./results/training_results/multimodal_thermal_classifier_results"):
         self.data_dir = Path(data_dir)
         self.db_path = Path(db_path)
-        self.output_dir = Path(output_dir)
-        
-        # 创建带时间戳的输出目录
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = self.output_dir / f"run_{timestamp}"
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.base_output_dir = Path(output_dir)
         
         # 类别映射
         self.class_to_idx = {'non_icas': 0, 'icas': 1}
         self.idx_to_class = {0: 'non_icas', 1: 'icas'}
-        
+
         print(f"数据目录: {self.data_dir}")
         print(f"数据库路径: {self.db_path}")
-        print(f"输出目录: {self.run_dir}")
+        print(f"基础输出目录: {self.base_output_dir}")
+
+    def create_descriptive_output_dir(self, best_model_name, focal_alpha, focal_gamma):
+        """创建描述性的输出目录"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 格式: MULTIMODAL-RF-FOCAL-A0.25-G2.0-20240829_143022
+        folder_name = f"MULTIMODAL-{best_model_name.upper()}-FOCAL-A{focal_alpha}-G{focal_gamma}-{timestamp}"
+
+        output_dir = self.base_output_dir / folder_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        return output_dir
     
     def load_clinical_features(self):
         """从数据库加载临床特征"""
@@ -1046,10 +1053,16 @@ class MultiModalThermalClassifier:
         # 5. 评估最佳模型
         best_model_name, best_model, test_results = self.evaluate_best_model(
             trained_models, results, X_test, y_test)
-        
+
+        # 创建描述性输出目录
+        self.run_dir = self.create_descriptive_output_dir(
+            best_model_name, config['focal_loss_alpha'], config['focal_loss_gamma']
+        )
+        print(f"输出目录: {self.run_dir}")
+
         total_time = time.time() - start_time
         config['total_training_time'] = total_time
-        
+
         # 6. 保存结果
         self.save_results(results, test_results, feature_info, config)
         
